@@ -1,0 +1,252 @@
+name: fetch-rect-tiles
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 30분마다 (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-rect-tiles
+  cancel-in-progress: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+ # 좌표입력: coordinates.txt 파일에서 읽기
+      - name: Load coordinates from file
+        id: coords
+        shell: bash
+        run: |
+          file="coordinates.txt"
+          if [ ! -f "$file" ]; then
+            echo "coordinates.txt not found!"
+            exit 1
+          fi
+
+          CORNER1=$(sed -n '1p' "$file" | tr -d '\r')
+          CORNER2=$(sed -n '2p' "$file" | tr -d '\r')
+
+          echo "corner1=$CORNER1" >> "$GITHUB_OUTPUT"
+          echo "corner2=$CORNER2" >> "$GITHUB_OUTPUT"
+
+      # 이후 단계에서 corner1, corner2 사용
+      - name: Debug print corners
+        run: |
+          echo "Corner1: ${{ steps.coords.outputs.corner1 }}"
+          echo "Corner2: ${{ steps.coords.outputs.corner2 }}"
+     
+      # ── 빠른 사전 체크: 모서리 4타일 헤더만 보고 변화 없으면 종료 ─────
+      - name: Fast header pre-check (4-corner sampling)
+        id: headcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          UA="github-actions-tile-bot (contact: youremail@example.com)"
+          BASE="https://backend.wplace.live/files/s0/tiles"
+
+          c1="${{ steps.cfg.outputs.corner1 }}"
+          c2="${{ steps.cfg.outputs.corner2 }}"
+
+          x1="${c1%%/*}"; y1="${c1##*/}"
+          x2="${c2%%/*}"; y2="${c2##*/}"
+
+          # 정규화 (min/max)
+          xmin=$(( x1 < x2 ? x1 : x2 ))
+          xmax=$(( x1 > x2 ? x1 : x2 ))
+          ymin=$(( y1 < y2 ? y1 : y2 ))
+          ymax=$(( y1 > y2 ? y1 : y2 ))
+
+          # 사각형 모서리 4개만 샘플
+          coords=(
+            "$xmin/$ymin"
+            "$xmin/$ymax"
+            "$xmax/$ymin"
+            "$xmax/$ymax"
+          )
+
+          SKIP_ALL=true
+          for c in "${coords[@]}"; do
+            X="${c%%/*}"; Y="${c##*/}"
+            url="$BASE/$X/$Y.png"
+
+            etag=$(curl -sI -H "User-Agent: $UA" "$url" | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\r"')
+            mod=$(curl  -sI -H "User-Agent: $UA" "$url" | awk -F': ' 'tolower($1)=="last-modified"{print $2}' | tr -d '\r')
+
+            prev_e=$(cat "state/${X}x${Y}.etag" 2>/dev/null || true)
+            prev_m=$(cat "state/${X}x${Y}.lastmod" 2>/dev/null || true)
+
+            if [ "$etag$mod" != "$prev_e$prev_m" ]; then
+              SKIP_ALL=false
+            fi
+
+            echo -n "$etag" > "state/${X}x${Y}.etag"
+            echo -n "$mod"  > "state/${X}x${Y}.lastmod"
+          done
+
+          echo "xmin=$xmin" >> "$GITHUB_OUTPUT"
+          echo "xmax=$xmax" >> "$GITHUB_OUTPUT"
+          echo "ymin=$ymin" >> "$GITHUB_OUTPUT"
+          echo "ymax=$ymax" >> "$GITHUB_OUTPUT"
+          echo "skip_all=$SKIP_ALL" >> "$GITHUB_OUTPUT"
+
+      - name: No change – fast exit
+        if: steps.headcheck.outputs.skip_all == 'true'
+        run: echo "No header change in sampled corners. Exit quickly."
+
+      # ── ImageMagick 설치 ────────────────────────────────────────────────
+      - name: Setup ImageMagick
+        if: steps.headcheck.outputs.skip_all != 'true'
+        uses: mfinelli/setup-imagemagick@v7.0.1
+        with:
+          cache: true
+          install-libfuse2: true
+
+      - name: Check magick binary
+        if: steps.headcheck.outputs.skip_all != 'true'
+        run: |
+          magick -version
+          which magick || true
+
+      # ── 사각형 내부 모든 타일 병렬 다운로드 → 행 단위로 가로 스티치 → 세로 스티치 ──
+      - name: Download rectangle tiles and stitch to one PNG
+        if: steps.headcheck.outputs.skip_all != 'true'
+        id: stitch
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA="github-actions-tile-bot (contact: youremail@example.com)"
+          BASE="https://backend.wplace.live/files/s0/tiles"
+          xmin=${{ steps.headcheck.outputs.xmin }}
+          xmax=${{ steps.headcheck.outputs.xmax }}
+          ymin=${{ steps.headcheck.outputs.ymin }}
+          ymax=${{ steps.headcheck.outputs.ymax }}
+
+          OUTDIR="images/rect_${xmin}-${xmax}x${ymin}-${ymax}"
+          mkdir -p "$OUTDIR/tiles" "$OUTDIR/rows"
+
+          DAYTIM="$(TZ=Asia/Seoul date +'%Y%m%d_%H%M%S')"
+          MOSAIC="${OUTDIR}/${DAYTIM}_rect_${xmin}-${xmax}x${ymin}-${ymax}.png"
+
+          # 1) 모든 타일 다운로드 (적당히 병렬)
+          pids=()
+          for ((y=ymin; y<=ymax; y++)); do
+            for ((x=xmin; x<=xmax; x++)); do
+              url="$BASE/$x/$y.png"
+              f="$OUTDIR/tiles/${x}_${y}.png"
+              (
+                curl -L --fail --silent --show-error --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+                     -H "User-Agent: $UA" -o "$f" "$url"
+                # 빈 파일 방지
+                [ -s "$f" ] || rm -f "$f"
+              ) &
+              pids+=($!)
+              # 동시 8개 정도로 제한 (원하면 조절)
+              if [ ${#pids[@]} -ge 8 ]; then
+                wait -n || true
+                # 완료된 pid 제거는 생략(무해)
+              fi
+            done
+          done
+          # 나머지 대기
+          for pid in "${pids[@]}"; do wait "$pid" || true; done
+
+          # 존재하는 파일 검사
+          cnt=$(ls -1 "$OUTDIR/tiles/"*.png 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$cnt" = "0" ]; then
+            echo "No tiles downloaded. Abort."
+            echo "skip_gif=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2) 각 행(y)에 대해 가로 스티치 (+append)
+          rowlist=()
+          for ((y=ymin; y<=ymax; y++)); do
+            rowimgs=()
+            for ((x=xmin; x<=xmax; x++)); do
+              f="$OUTDIR/tiles/${x}_${y}.png"
+              [ -s "$f" ] && rowimgs+=("$f")
+            done
+            if [ ${#rowimgs[@]} -gt 0 ]; then
+              rowpng="$OUTDIR/rows/row_${y}.png"
+              magick convert +append "${rowimgs[@]}" "$rowpng"
+              rowlist+=("$rowpng")
+            fi
+          done
+
+          if [ ${#rowlist[@]} -eq 0 ]; then
+            echo "No rows built. Abort."
+            echo "skip_gif=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3) 모든 행을 세로로 스티치 (-append) → 최종 모자이크
+          magick convert -append "${rowlist[@]}" "$MOSAIC"
+          echo "Mosaic built: $MOSAIC"
+
+          # 4) 직전 모자이크와 비교 (≤3 픽셀 차이는 스킵)
+          PREV="$(ls -1 "$OUTDIR"/*_rect_*.png 2>/dev/null | grep -v "$MOSAIC" | sort | tail -n 1 || true)"
+          echo "skip_gif=false" >> "$GITHUB_OUTPUT"
+          if [ -n "$PREV" ]; then
+            DIFF_RAW="$(magick compare -metric AE "$MOSAIC" "$PREV" null: 2>&1 || true)"
+            DIFF="$(echo "$DIFF_RAW" | awk '{print $1}')"
+            if [ "$DIFF" -le 3 ]; then
+              echo "No meaningful change (diff=$DIFF). Remove new mosaic."
+              rm -f "$MOSAIC"
+              echo "skip_gif=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Visual change detected (diff=$DIFF). Keep mosaic."
+            fi
+          fi
+
+      # ── GIF 갱신 (변화가 있을 때만) ────────────────────────────────────
+      - name: Update GIF
+        if: steps.headcheck.outputs.skip_all != 'true' && steps.stitch.outputs.skip_gif != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xmin=${{ steps.headcheck.outputs.xmin }}
+          xmax=${{ steps.headcheck.outputs.xmax }}
+          ymin=${{ steps.headcheck.outputs.ymin }}
+          ymax=${{ steps.headcheck.outputs.ymax }}
+          OUTDIR="images/rect_${xmin}-${xmax}x${ymin}-${ymax}"
+          GIF_OUT="images/rect_${xmin}-${xmax}x${ymin}-${ymax}.gif"
+
+          mapfile -t png_files < <(find "$OUTDIR" -maxdepth 1 -type f -name "*_rect_*.png" | sort)
+          [ "${#png_files[@]}" -eq 0 ] && { echo "No mosaics found. Skip GIF."; exit 0; }
+
+          if [ "${#png_files[@]}" -eq 1 ]; then
+            magick convert -delay 300 -loop 0 -dispose Background "${png_files[0]}" "$GIF_OUT"
+          else
+            last="${png_files[-1]}"
+            magick convert \
+              -delay 20 "${png_files[@]::${#png_files[@]}-1}" \
+              -delay 300 "$last" \
+              -loop 0 -dispose Background \
+              "$GIF_OUT"
+          fi
+          echo "GIF updated: $GIF_OUT"
+
+      - name: Commit and push if changed
+        shell: bash
+        run: |
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "github-actions"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: fetch rect tiles ${{
+              steps.headcheck.outputs.xmin }}-${{ steps.headcheck.outputs.xmax }}x${{
+              steps.headcheck.outputs.ymin }}-${{ steps.headcheck.outputs.ymax }}; stitch grid; dedupe ≤3px; update GIF [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
