@@ -21,29 +21,18 @@ jobs:
         with:
           fetch-depth: 0
 
- # 좌표입력: coordinates.txt 파일에서 읽기
-      - name: Load coordinates from file
-        id: coords
+      # ── 설정: 두 꼭지점(코너) ────────────────────────────────────────────
+      - name: Set corners
+        id: cfg
         shell: bash
         run: |
-          file="coordinates.txt"
-          if [ ! -f "$file" ]; then
-            echo "coordinates.txt not found!"
-            exit 1
-          fi
-
-          CORNER1=$(sed -n '1p' "$file" | tr -d '\r')
-          CORNER2=$(sed -n '2p' "$file" | tr -d '\r')
+          # 원하는 사각형의 두 꼭지점(좌상단, 우하단) 쓰세요 (x/y, x/y)
+          CORNER1="1773/794"
+          CORNER2="1775/796"
 
           echo "corner1=$CORNER1" >> "$GITHUB_OUTPUT"
           echo "corner2=$CORNER2" >> "$GITHUB_OUTPUT"
 
-      # 이후 단계에서 corner1, corner2 사용
-      - name: Debug print corners
-        run: |
-          echo "Corner1: ${{ steps.coords.outputs.corner1 }}"
-          echo "Corner2: ${{ steps.coords.outputs.corner2 }}"
-     
       # ── 빠른 사전 체크: 모서리 4타일 헤더만 보고 변화 없으면 종료 ─────
       - name: Fast header pre-check (4-corner sampling)
         id: headcheck
